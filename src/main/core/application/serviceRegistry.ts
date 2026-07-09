@@ -41,6 +41,7 @@ import { OAuthRuntimeService } from '@main/services/oauth/runtime/OAuthRuntimeSe
 import { OpenClawService } from '@main/services/OpenClawService'
 import { OvmsManager } from '@main/services/OvmsManager'
 import { ProtocolService } from '@main/services/protocol/ProtocolService'
+import { ProviderRegistryUpdaterService } from '@main/services/ProviderRegistryUpdaterService'
 import { ProxyService } from '@main/services/proxy/ProxyService'
 import { PythonService } from '@main/services/PythonService'
 import { QuickAssistantService } from '@main/services/QuickAssistantService'
@@ -136,6 +137,7 @@ export const services = {
   ApiGatewayService,
   AppUpdaterService,
   AutoBackupService,
+  ProviderRegistryUpdaterService,
   SchedulerService,
   JobManager
 } as const
