@@ -39,6 +39,7 @@ import { MainWindowService } from '@main/services/MainWindowService'
 import { OAuthRuntimeService } from '@main/services/oauth/runtime/OAuthRuntimeService'
 import { OpenClawService } from '@main/services/OpenClawService'
 import { OvmsManager } from '@main/services/OvmsManager'
+import { PdfTranslationService } from '@main/services/PdfTranslationService'
 import { ProtocolService } from '@main/services/protocol/ProtocolService'
 import { ProxyService } from '@main/services/proxy/ProxyService'
 import { PythonService } from '@main/services/PythonService'
@@ -118,6 +119,7 @@ export const services = {
   McpCatalogService,
   BinaryManager,
   OpenClawService,
+  PdfTranslationService,
   ClaudeCodeProcessManager,
   AgentSessionRuntimeService,
   AgentJobsService,
