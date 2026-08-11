@@ -7283,7 +7283,6 @@
       },
       "progress": {
         "analyzing": "Analyzing document layout",
-        "details": "Stage {{stageProgress}}% · Overall {{overallProgress}}%",
         "downloading_assets": "Downloading PDF processing resources...",
         "generating": "Generating translated PDF",
         "percent": "{{progress}}%",
