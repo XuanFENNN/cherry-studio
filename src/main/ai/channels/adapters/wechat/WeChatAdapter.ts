@@ -18,12 +18,82 @@ const WECHAT_MAX_LENGTH = 2000
 /** Markdown image reference: `![alt](path)` (optional quoted title tolerated). */
 const MARKDOWN_IMAGE_REF_RE = /!\[[^\]]*\]\(([^)]*)\)/g
 
+/** Markdown media reference: `![alt](path)` embed form + `[text](path)` link form. */
+const MARKDOWN_MEDIA_REF_RE = /(!?)\[([^\]]*)\]\(([^)]*)\)/g
+
+/** 媒体类型桶：微信协议出站支持的四种消息类型。 */
+type MediaKind = 'image' | 'video' | 'audio' | 'file'
+
+/** 扩展名 → 媒体类型（MIME 前缀优先，扩展名兜底；未列出的扩展名一律归为 file）。 */
+const MEDIA_EXTENSION_KIND: Record<string, Exclude<MediaKind, 'file'>> = {
+  // 图片
+  png: 'image',
+  jpg: 'image',
+  jpeg: 'image',
+  gif: 'image',
+  webp: 'image',
+  bmp: 'image',
+  svg: 'image',
+  // 视频
+  mp4: 'video',
+  m4v: 'video',
+  mov: 'video',
+  avi: 'video',
+  mkv: 'video',
+  webm: 'video',
+  flv: 'video',
+  wmv: 'video',
+  // 音频
+  mp3: 'audio',
+  wav: 'audio',
+  m4a: 'audio',
+  aac: 'audio',
+  ogg: 'audio',
+  oga: 'audio',
+  flac: 'audio',
+  wma: 'audio',
+  amr: 'audio',
+  opus: 'audio',
+  silk: 'audio'
+}
+
+/** 远程 URL 引用（http/https/data/mailto 等）：保留原文为链接，不当作本地媒体发送。 */
+function isRemoteMediaRef(target: string): boolean {
+  return /^(https?:|data:|mailto:|ftp:)/i.test(target)
+}
+
 /**
- * Remove complete markdown image references from text — their media is delivered
- * as real images instead (see `extractAndSendImages`).
+ * 按 media_type（MIME 前缀）与扩展名把附件路由到微信协议支持的媒体类型。
+ * media_type 可信时优先；仅当它是通用类型（如 application/octet-stream）时用扩展名兜底。
  */
-function stripMarkdownImageRefs(text: string): string {
-  return text.replace(MARKDOWN_IMAGE_REF_RE, '')
+function resolveMediaKind(mediaType: string, filename: string): MediaKind {
+  if (mediaType.startsWith('image/')) return 'image'
+  if (mediaType.startsWith('video/')) return 'video'
+  if (mediaType.startsWith('audio/')) return 'audio'
+  const ext = filename.includes('.') ? filename.split('.').pop()!.toLowerCase() : ''
+  return MEDIA_EXTENSION_KIND[ext] ?? 'file'
+}
+
+/**
+ * Remove complete markdown media references from text — their media is delivered
+ * as real attachments instead (see `extractAndSendImages` / `extractAndSendMedia`).
+ *
+ * - `![alt](path)` embed form: always stripped (images keep the v1 behavior; a
+ *   non-image embed target is sent as file/video/voice at stream complete).
+ * - `[text](path)` link form: only stripped when the target is a local file path
+ *   (has an extension); remote URLs and extension-less paths stay as text links.
+ */
+function stripMarkdownMediaRefs(text: string): string {
+  return text.replace(MARKDOWN_MEDIA_REF_RE, (full, bang, _label, rawTarget) => {
+    const isEmbed = bang === '!'
+    const target = (rawTarget ?? '').trim().replace(/^['"]|['"]$/g, '')
+    if (isEmbed) return ''
+    // 链接形式：远程 URL 或没有扩展名的路径保留原文
+    if (!target || isRemoteMediaRef(target)) return full
+    const ext = target.split('.').pop()
+    if (!ext || ext === target) return full
+    return ''
+  })
 }
 
 class WeChatAdapter extends ChannelAdapter {
@@ -128,13 +198,14 @@ class WeChatAdapter extends ChannelAdapter {
     if (!this.bot) {
       throw new Error('Bot is not connected')
     }
-    // The reverse-engineered WeChat protocol only supports outbound images today
-    // (WeixinBot.sendImage). Document upload would need protocol-level CDN work.
-    if (!file.media_type.startsWith('image/')) {
-      throw new Error(`WeChat can only forward image files, not "${file.media_type}" (${file.filename})`)
+    const data = Buffer.from(file.data, 'base64')
+    if (data.length === 0) {
+      throw new Error(`WeChat cannot send an empty file: "${file.filename}"`)
     }
-    await this.bot.sendImage(chatId, Buffer.from(file.data, 'base64'))
-    this.log.info('Sent file', { chatId, filename: file.filename, size: file.size })
+    // 按 media_type / 扩展名路由：图片→sendImage、视频→sendVideo、音频→sendVoice（降级 sendFile）、其余→sendFile
+    const kind = resolveMediaKind(file.media_type, file.filename)
+    await this.sendAttachment(chatId, file, kind)
+    this.log.info('Sent file', { chatId, filename: file.filename, size: file.size, kind })
   }
 
   async sendTypingIndicator(chatId: string): Promise<void> {
@@ -178,8 +249,9 @@ class WeChatAdapter extends ChannelAdapter {
     if (!this.bot) return false
     this.latestFullTexts.set(chatId, finalText)
     await this.flushUnsentText(chatId)
-    // 图片引用以真实图片发送（保留一期实现，图片逻辑后续阶段再处理）
+    // 图片引用以真实图片发送（保留一期实现）；文件/视频/音频引用并行发送
     await this.extractAndSendImages(chatId, finalText)
+    await this.extractAndSendMedia(chatId, finalText)
     this.latestFullTexts.delete(chatId)
     this.sentTexts.delete(chatId)
     this.sendQueues.delete(chatId)
@@ -227,8 +299,8 @@ class WeChatAdapter extends ChannelAdapter {
     const bot = this.bot
     if (!bot) return
     const fullText = this.latestFullTexts.get(chatId) ?? ''
-    // 图片引用在 onStreamComplete 里以真实图片发送，正文不出现原始 markdown
-    const deliverable = stripMarkdownImageRefs(fullText)
+    // 图片/文件/视频/音频引用在 onStreamComplete 里以真实媒体发送，正文不出现原始 markdown
+    const deliverable = stripMarkdownMediaRefs(fullText)
     const sent = this.sentTexts.get(chatId) ?? ''
     // 相对 sentText 的未发送尾部：常规为前缀差；被剥离的图片引用会让前后长度
     // 不一致，退化为最长公共前缀
@@ -293,6 +365,99 @@ class WeChatAdapter extends ChannelAdapter {
         })
       } catch (error) {
         this.log.warn('Failed to send markdown image reference', {
+          chatId,
+          path: rawPath,
+          error: error instanceof Error ? error.message : String(error)
+        })
+      }
+    }
+    return cleaned
+  }
+
+  /**
+   * 按媒体类型发送附件（与 sendFile 共用路由；markdown 媒体引用也走这里）。
+   */
+  private async sendAttachment(chatId: string, attachment: FileAttachment, kind: MediaKind): Promise<void> {
+    const bot = this.bot
+    if (!bot) throw new Error('Bot is not connected')
+    const data = Buffer.from(attachment.data, 'base64')
+    switch (kind) {
+      case 'image':
+        await bot.sendImage(chatId, data)
+        break
+      case 'video':
+        await bot.sendVideo(chatId, data)
+        break
+      case 'audio':
+        await this.sendAudioWithVoiceFallback(chatId, data, attachment.filename)
+        break
+      default:
+        await bot.sendFile(chatId, data, attachment.filename)
+        break
+    }
+  }
+
+  /**
+   * 语音降级：先尝试 VOICE 语音条，随后无论成败都回退为 FILE 音频附件。
+   *
+   * 协议文档（T4a）实测提示：iLink 通道会静默丢弃 bot 方向的 VOICE 消息——HTTP 200
+   * 但客户端不出现语音气泡，官方插件从不发 VOICE 而统一用文件附件代替。因此 sendVoice
+   * 失败或返回后都必须再发一份文件，保证用户一定能收到可播放的音频文件卡片。
+   */
+  private async sendAudioWithVoiceFallback(chatId: string, data: Buffer, filename: string): Promise<void> {
+    const bot = this.bot
+    if (!bot) throw new Error('Bot is not connected')
+    // 协议不暴露音频时长，按默认 24kHz/16bit 单声道 ≈ 48 字节/毫秒 粗略估算（仅供 VOICE 占位；
+    // 实际送达依赖下方文件附件的回退路径）
+    const playtimeMs = Math.max(1, Math.floor(data.length / 48))
+    try {
+      await bot.sendVoice(chatId, data, { playtimeMs })
+    } catch (error) {
+      this.log.warn('sendVoice failed, falling back to file attachment', {
+        chatId,
+        filename,
+        error: error instanceof Error ? error.message : String(error)
+      })
+    }
+    // VOICE 成功与否都无法确认送达（静默丢弃时同样返回 200），因此总是再发一份文件附件
+    await bot.sendFile(chatId, data, filename)
+  }
+
+  /**
+   * 扫描最终正文中的文件/视频/音频引用（`[text](path)` 链接形式 + `![alt](path)` 嵌入形式），
+   * 按扩展名/URL 判断媒体类型并发送真实附件；嵌入形式的图片引用仍由 extractAndSendImages
+   * 处理（本方法跳过，避免重复发送）。
+   */
+  private async extractAndSendMedia(chatId: string, text: string): Promise<string> {
+    const bot = this.bot
+    if (!bot) return text
+    const matches = Array.from(text.matchAll(MARKDOWN_MEDIA_REF_RE))
+    if (matches.length === 0) return text
+
+    const workspaceRoot = await this.resolveWorkspaceRoot()
+    let cleaned = text
+    for (const match of matches) {
+      const isEmbed = match[1] === '!'
+      const rawPath = (match[3] ?? '').trim().replace(/^['"]|['"]$/g, '')
+      if (!rawPath || isRemoteMediaRef(rawPath)) continue
+      try {
+        // 与 extractAndSendImages 相同的解析路径：会话工作区内优先，否则按原路径解析
+        const attachment = workspaceRoot
+          ? await resolveWorkspaceFile(workspaceRoot, rawPath)
+          : await resolveLocalFile('', rawPath)
+        const kind = resolveMediaKind(attachment.media_type, attachment.filename)
+        // 嵌入形式的图片引用由 extractAndSendImages 发送，这里跳过
+        if (kind === 'image' && isEmbed) continue
+        await this.sendAttachment(chatId, attachment, kind)
+        cleaned = cleaned.replace(match[0], '')
+        this.log.info('Sent media from markdown reference', {
+          chatId,
+          path: rawPath,
+          filename: attachment.filename,
+          kind
+        })
+      } catch (error) {
+        this.log.warn('Failed to send markdown media reference', {
           chatId,
           path: rawPath,
           error: error instanceof Error ? error.message : String(error)

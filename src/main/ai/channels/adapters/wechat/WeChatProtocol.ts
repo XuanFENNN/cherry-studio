@@ -42,10 +42,51 @@ enum MessageItemType {
   VIDEO = 5
 }
 
+/**
+ * getuploadurl 的 media_type（proto: UploadMediaType）。
+ * ⚠️ 编号与 MessageItemType 不一致且 VOICE/FILE 恰好对调，严禁混用：
+ *   MessageItemType（item_list[].type）：IMAGE=2 VOICE=3 FILE=4 VIDEO=5
+ *   UploadMediaType（getuploadurl）  ：IMAGE=1 VIDEO=2 FILE=3 VOICE=4
+ */
+enum UploadMediaType {
+  IMAGE = 1,
+  VIDEO = 2,
+  FILE = 3,
+  VOICE = 4
+}
+
 interface CDNMedia {
   encrypt_query_param?: string
   aes_key?: string
   encrypt_type?: number
+}
+
+interface FileItem {
+  file_name?: string
+  /** 协议实际字段：明文大小（字符串）。出站发送文件必填；入站服务端同样下发 len。 */
+  len?: string
+  /** 旧字段，仅入站兼容——协议出站用 len，不填 file_size。 */
+  file_size?: number
+  media?: CDNMedia
+  aeskey?: string
+}
+
+interface VoiceItem {
+  /** 入站 ASR 转写文本；出站不填。 */
+  text?: string
+  media?: CDNMedia
+  /** 编码类型：6=SILK（微信语音条默认）。 */
+  encode_type?: number
+  bits_per_sample?: number
+  sample_rate?: number
+  /** 语音长度（毫秒），出站必填。 */
+  playtime?: number
+}
+
+interface VideoItem {
+  media?: CDNMedia
+  /** 密文大小（PKCS7 补齐后），出站必填；官方实现不传缩略图/时长/宽高。 */
+  video_size?: number
 }
 
 interface ImageItem {
@@ -64,9 +105,9 @@ interface MessageItem {
   type: MessageItemType
   text_item?: { text: string }
   image_item?: ImageItem
-  voice_item?: { text?: string }
-  file_item?: { file_name?: string; file_size?: number; media?: CDNMedia; aeskey?: string }
-  video_item?: unknown
+  voice_item?: VoiceItem
+  file_item?: FileItem
+  video_item?: VideoItem
   ref_msg?: unknown
 }
 
@@ -91,7 +132,7 @@ export interface IncomingMessage {
   /** Raw image items from WeChat CDN (encrypted, need download+decrypt). */
   _imageItems?: ImageItem[]
   /** Raw file items from WeChat CDN (encrypted, need download+decrypt). */
-  _fileItems?: Array<{ file_name?: string; file_size?: number; media?: CDNMedia; aeskey?: string }>
+  _fileItems?: FileItem[]
 }
 
 // --------------- Zod response schemas ---------------
@@ -224,8 +265,6 @@ async function cdnDownloadImage(item: ImageItem): Promise<Buffer | null> {
   return aesEcbDecrypt(encrypted, aesKey)
 }
 
-type FileItem = NonNullable<MessageItem['file_item']>
-
 /**
  * Parse a CDNMedia.aes_key into a raw 16-byte AES key.
  *
@@ -297,16 +336,30 @@ const GetUploadUrlRespSchema = z.object({
   upload_param: z.string()
 })
 
-async function cdnUploadImage(
+/** CDN 上传结果——出站 item 构造所需的全部字段。 */
+interface UploadedMedia {
+  downloadEncryptedQueryParam: string
+  aeskey: Buffer
+  /** 密文大小（PKCS7 补齐后），image_item.mid_size / video_item.video_size 使用。 */
+  ciphertextSize: number
+}
+
+/**
+ * 通用 CDN 上传：getuploadurl(media_type) → AES-128-ECB 加密 → POST /upload。
+ * IMAGE/VIDEO/FILE/VOICE 的加密与上传路径无差异（octet-stream + x-encrypted-param），
+ * 仅 media_type 不同——由调用方按 UploadMediaType 传入。
+ */
+async function cdnUploadMedia(
   baseUrl: string,
   token: string,
   uin: string,
   toUserId: string,
-  imageData: Buffer
-): Promise<{ downloadEncryptedQueryParam: string; aeskey: Buffer; ciphertextSize: number } | null> {
+  data: Buffer,
+  mediaType: UploadMediaType
+): Promise<UploadedMedia | null> {
   const aeskey = randomBytes(16)
   const filekey = randomBytes(16).toString('hex')
-  const md5Hash = await import('node:crypto').then((c) => c.createHash('md5').update(imageData).digest('hex'))
+  const md5Hash = await import('node:crypto').then((c) => c.createHash('md5').update(data).digest('hex'))
 
   // Step 1: get upload URL
   const raw = await apiFetch(
@@ -314,11 +367,11 @@ async function cdnUploadImage(
     '/ilink/bot/getuploadurl',
     {
       filekey,
-      media_type: 1,
+      media_type: mediaType,
       to_user_id: toUserId,
-      rawsize: imageData.length,
+      rawsize: data.length,
       rawfilemd5: md5Hash,
-      filesize: imageData.length,
+      filesize: data.length,
       no_need_thumb: true,
       aeskey: aeskey.toString('hex'),
       base_info: buildBaseInfo()
@@ -330,7 +383,7 @@ async function cdnUploadImage(
   const { upload_param } = GetUploadUrlRespSchema.parse(raw)
 
   // Step 2: encrypt and upload
-  const ciphertext = aesEcbEncrypt(imageData, aeskey)
+  const ciphertext = aesEcbEncrypt(data, aeskey)
   const uploadUrl = `${CDN_BASE_URL}/upload?encrypted_query_param=${encodeURIComponent(upload_param)}&filekey=${encodeURIComponent(filekey)}`
   const uploadResp = await net.fetch(uploadUrl, {
     method: 'POST',
@@ -339,7 +392,7 @@ async function cdnUploadImage(
   })
 
   if (!uploadResp.ok) {
-    logger.error('CDN upload failed', { status: uploadResp.status })
+    logger.error('CDN upload failed', { status: uploadResp.status, mediaType })
     return null
   }
 
@@ -808,15 +861,89 @@ export class WeixinBot {
    * Send an image to a user by uploading to WeChat CDN.
    */
   async sendImage(userId: string, imageData: Buffer): Promise<void> {
+    await this.uploadAndSendMedia(userId, imageData, UploadMediaType.IMAGE, 'image', (uploaded) => ({
+      type: MessageItemType.IMAGE,
+      image_item: {
+        media: {
+          encrypt_query_param: uploaded.downloadEncryptedQueryParam,
+          // 图片沿用一期格式：base64(原始 16 字节)；FILE/VOICE/VIDEO 用官方 base64(hex 字符串)
+          aes_key: Buffer.from(uploaded.aeskey).toString('base64'),
+          encrypt_type: 1
+        },
+        mid_size: uploaded.ciphertextSize
+      }
+    }))
+  }
+
+  /**
+   * Send a file to a user（getuploadurl media_type=FILE，item type=4）。
+   * item：file_item{ media, file_name, len }，len 为字符串形式的明文大小。
+   */
+  async sendFile(userId: string, data: Buffer, fileName: string): Promise<void> {
+    await this.uploadAndSendMedia(userId, data, UploadMediaType.FILE, 'file', (uploaded) => ({
+      type: MessageItemType.FILE,
+      file_item: {
+        media: this.buildMediaField(uploaded),
+        file_name: fileName,
+        len: String(data.length)
+      }
+    }))
+  }
+
+  /**
+   * Send a voice clip（getuploadurl media_type=VOICE，item type=3）。
+   * item：voice_item{ media, encode_type:6(SILK), bits_per_sample:16, sample_rate:24000, playtime }。
+   * ⚠️ 协议文档实测提示 bot 方向 VOICE 可能被微信静默丢弃（HTTP 200 但无气泡），
+   * 调用方（WeChatAdapter.sendAudioWithVoiceFallback）负责在失败/返回后降级为文件附件。
+   */
+  async sendVoice(userId: string, data: Buffer, options: { playtimeMs: number }): Promise<void> {
+    await this.uploadAndSendMedia(userId, data, UploadMediaType.VOICE, 'voice', (uploaded) => ({
+      type: MessageItemType.VOICE,
+      voice_item: {
+        media: this.buildMediaField(uploaded),
+        encode_type: 6, // SILK（微信语音条默认编码）
+        bits_per_sample: 16,
+        sample_rate: 24000,
+        playtime: options.playtimeMs // 毫秒
+      }
+    }))
+  }
+
+  /**
+   * Send a video（getuploadurl media_type=VIDEO，item type=5）。
+   * item：video_item{ media, video_size }，video_size 为密文大小（PKCS7 补齐后）。
+   */
+  async sendVideo(userId: string, data: Buffer): Promise<void> {
+    await this.uploadAndSendMedia(userId, data, UploadMediaType.VIDEO, 'video', (uploaded) => ({
+      type: MessageItemType.VIDEO,
+      video_item: {
+        media: this.buildMediaField(uploaded),
+        video_size: uploaded.ciphertextSize
+      }
+    }))
+  }
+
+  /**
+   * 上传媒体到 CDN 并发送一条仅含单个 media item 的 sendmessage。
+   * 所有媒体类型共用同一流程：getuploadurl(mediaType) → CDN 上传 → sendmessage。
+   * item 由 buildItem 按类型构造。
+   */
+  private async uploadAndSendMedia(
+    userId: string,
+    data: Buffer,
+    mediaType: UploadMediaType,
+    label: string,
+    buildItem: (uploaded: UploadedMedia) => MessageItem
+  ): Promise<void> {
     const contextToken = this.contextTokens.get(userId)
     if (!contextToken) {
-      logger.warn('No cached context token for sendImage, sending without context', { userId })
+      logger.warn(`No cached context token for ${label}, sending without context`, { userId })
     }
 
     const credentials = await this.ensureCredentials()
-    const uploaded = await cdnUploadImage(this.baseUrl, credentials.token, this.uin, userId, imageData)
+    const uploaded = await cdnUploadMedia(this.baseUrl, credentials.token, this.uin, userId, data, mediaType)
     if (!uploaded) {
-      throw new Error('Failed to upload image to WeChat CDN')
+      throw new Error(`Failed to upload ${label} to WeChat CDN`)
     }
 
     const msg = {
@@ -826,22 +953,22 @@ export class WeixinBot {
       message_type: MessageType.BOT,
       message_state: MessageState.FINISH,
       context_token: contextToken ?? '',
-      item_list: [
-        {
-          type: MessageItemType.IMAGE,
-          image_item: {
-            media: {
-              encrypt_query_param: uploaded.downloadEncryptedQueryParam,
-              aes_key: Buffer.from(uploaded.aeskey).toString('base64'),
-              encrypt_type: 1
-            },
-            mid_size: uploaded.ciphertextSize
-          }
-        }
-      ]
+      item_list: [buildItem(uploaded)]
     }
 
     await apiSendMessage(this.baseUrl, credentials.token, this.uin, msg)
+  }
+
+  /**
+   * 出站 media 字段构造：aes_key 按官方格式 base64(32 字符 hex 字符串 ASCII 字节)。
+   * 服务端兼容 base64(原始 16 字节) 与 base64(hex 字符串) 两种编码，FILE/VOICE/VIDEO 优先官方格式。
+   */
+  private buildMediaField(uploaded: UploadedMedia): CDNMedia {
+    return {
+      encrypt_query_param: uploaded.downloadEncryptedQueryParam,
+      aes_key: Buffer.from(uploaded.aeskey.toString('hex')).toString('base64'),
+      encrypt_type: 1
+    }
   }
 
   async run(): Promise<void> {
