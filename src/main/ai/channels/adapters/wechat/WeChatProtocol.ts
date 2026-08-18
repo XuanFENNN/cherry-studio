@@ -333,7 +333,9 @@ async function cdnDownloadFile(item: FileItem): Promise<Buffer | null> {
 // --------------- CDN upload ---------------
 
 const GetUploadUrlRespSchema = z.object({
-  upload_param: z.string()
+  upload_param: z.string().optional(),
+  /** 官方较新的响应字段：服务端直接返回完整上传 URL，存在时优先直接 POST（无需客户端拼接）。 */
+  upload_full_url: z.string().optional()
 })
 
 /** CDN 上传结果——出站 item 构造所需的全部字段。 */
@@ -345,7 +347,7 @@ interface UploadedMedia {
 }
 
 /**
- * 通用 CDN 上传：getuploadurl(media_type) → AES-128-ECB 加密 → POST /upload。
+ * 通用 CDN 上传：AES-128-ECB 加密 → getuploadurl(media_type, filesize=密文大小) → POST /upload。
  * IMAGE/VIDEO/FILE/VOICE 的加密与上传路径无差异（octet-stream + x-encrypted-param），
  * 仅 media_type 不同——由调用方按 UploadMediaType 传入。
  */
@@ -360,6 +362,10 @@ async function cdnUploadMedia(
   const aeskey = randomBytes(16)
   const filekey = randomBytes(16).toString('hex')
   const md5Hash = await import('node:crypto').then((c) => c.createHash('md5').update(data).digest('hex'))
+  // 先加密再请求 getuploadurl：官方（Tencent/openclaw-weixin upload.ts）的 filesize 是
+  // PKCS7 密文大小（Math.ceil((rawsize+1)/16)*16），而非明文大小。直接复用 ciphertext.length
+  // 可保证与实际上传的密文严格一致——filesize 与上传体不一致是「文件已过期/已被清理」的最可疑根因。
+  const ciphertext = aesEcbEncrypt(data, aeskey)
 
   // Step 1: get upload URL
   const raw = await apiFetch(
@@ -371,7 +377,7 @@ async function cdnUploadMedia(
       to_user_id: toUserId,
       rawsize: data.length,
       rawfilemd5: md5Hash,
-      filesize: data.length,
+      filesize: ciphertext.length,
       no_need_thumb: true,
       aeskey: aeskey.toString('hex'),
       base_info: buildBaseInfo()
@@ -380,11 +386,18 @@ async function cdnUploadMedia(
     uin,
     15_000
   )
-  const { upload_param } = GetUploadUrlRespSchema.parse(raw)
+  const resp = GetUploadUrlRespSchema.parse(raw)
+  const uploadFullUrl = resp.upload_full_url?.trim()
+  const uploadParam = resp.upload_param
+  if (!uploadFullUrl && !uploadParam) {
+    logger.error('getuploadurl response missing both upload_full_url and upload_param', { mediaType })
+    return null
+  }
 
-  // Step 2: encrypt and upload
-  const ciphertext = aesEcbEncrypt(data, aeskey)
-  const uploadUrl = `${CDN_BASE_URL}/upload?encrypted_query_param=${encodeURIComponent(upload_param)}&filekey=${encodeURIComponent(filekey)}`
+  // Step 2: upload（官方优先直接 POST upload_full_url，否则回退用 upload_param 拼接）
+  const uploadUrl = uploadFullUrl
+    ? uploadFullUrl
+    : `${CDN_BASE_URL}/upload?encrypted_query_param=${encodeURIComponent(uploadParam!)}&filekey=${encodeURIComponent(filekey)}`
   const uploadResp = await net.fetch(uploadUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/octet-stream' },
@@ -864,12 +877,10 @@ export class WeixinBot {
     await this.uploadAndSendMedia(userId, imageData, UploadMediaType.IMAGE, 'image', (uploaded) => ({
       type: MessageItemType.IMAGE,
       image_item: {
-        media: {
-          encrypt_query_param: uploaded.downloadEncryptedQueryParam,
-          // 图片沿用一期格式：base64(原始 16 字节)；FILE/VOICE/VIDEO 用官方 base64(hex 字符串)
-          aes_key: Buffer.from(uploaded.aeskey).toString('base64'),
-          encrypt_type: 1
-        },
+        // aes_key 与 FILE/VOICE/VIDEO 统一为官方格式 base64(hex 字符串)：
+        // 官方 openclaw-weixin send.ts 对所有媒体类型都按 base64(aeskey hex ASCII) 出站，
+        // 下载端两种编码都兼容，但上传后客户端解密以官方格式为准。
+        media: this.buildMediaField(uploaded),
         mid_size: uploaded.ciphertextSize
       }
     }))
@@ -960,8 +971,9 @@ export class WeixinBot {
   }
 
   /**
-   * 出站 media 字段构造：aes_key 按官方格式 base64(32 字符 hex 字符串 ASCII 字节)。
-   * 服务端兼容 base64(原始 16 字节) 与 base64(hex 字符串) 两种编码，FILE/VOICE/VIDEO 优先官方格式。
+   * 出站 media 字段构造（IMAGE/FILE/VOICE/VIDEO 统一）：aes_key 按官方格式 base64(32 字符 hex 字符串 ASCII 字节)。
+   * 官方 openclaw-weixin send.ts 对所有媒体类型都是 base64(aeskey hex)；下载端虽兼容 base64(原始 16 字节)，
+   * 但上传侧以官方格式为准，避免客户端解密异常。
    */
   private buildMediaField(uploaded: UploadedMedia): CDNMedia {
     return {
