@@ -24,6 +24,21 @@ import { wrapExternalContent } from './security/ExternalContentGuard'
 
 const logger = loggerService.withContext('ChannelMessageHandler')
 
+/**
+ * Chunk types that mark a stage boundary: the model starts/continues thinking
+ * (`reasoning-delta`) or invokes a tool (AI SDK `UIMessageChunk` tool types).
+ * At a boundary the text produced so far is a complete stage — the adapter
+ * flushes it as one full message instead of incremental bubbles.
+ */
+const STAGE_BOUNDARY_CHUNK_TYPES = new Set([
+  'reasoning-delta',
+  'tool-input-available',
+  'tool-approval-request',
+  'tool-output-available',
+  'tool-output-error',
+  'tool-output-denied'
+])
+
 const TYPING_INTERVAL_MS = 4000
 
 /** Max number of entries in the session tracker before evicting oldest entries. */
@@ -887,17 +902,6 @@ export class ChannelMessageHandler {
     })
     let accumulatedText = ''
     let accumulatedThinking = ''
-    // Fire-and-forget thinking completion callback, shared by all terminal states.
-    const notifyThinkingComplete = (): void => {
-      adapter
-        .onThinkingComplete(chatId, accumulatedThinking)
-        .catch((err) => {
-          logger.debug('onThinkingComplete callback failed', {
-            chatId,
-            error: err instanceof Error ? err.message : String(err)
-          })
-        })
-    }
     const sentinel: StreamListener = {
       id: `channel-completion:${chatId}`,
       onChunk(chunk) {
@@ -905,34 +909,37 @@ export class ChannelMessageHandler {
         if (chunk.type === 'text-delta') {
           accumulatedText += chunk.delta
         } else if (chunk.type === 'reasoning-delta') {
-          // Accumulate incremental reasoning deltas and surface them through the
-          // adapter's thinking hooks (the adapter throttles its own flushing).
+          // Keep accumulating reasoning deltas for bookkeeping; thinking is
+          // never surfaced to the channel (WeChat shows no thinking UI), so
+          // onThinkingUpdate is intentionally not called anymore.
           const delta = (chunk as unknown as { delta?: string }).delta
           if (delta) {
             accumulatedThinking += delta
-            adapter
-              .onThinkingUpdate(chatId, accumulatedThinking)
-              .catch((err) => {
-                logger.debug('onThinkingUpdate callback failed', {
-                  chatId,
-                  error: err instanceof Error ? err.message : String(err)
-                })
-              })
           }
+        }
+        // Stage boundary: thinking starts/continues or a tool is invoked — the
+        // text accumulated so far is a complete stage. Fire-and-forget: only
+        // tell the adapter a boundary exists; the adapter does the sending.
+        if (STAGE_BOUNDARY_CHUNK_TYPES.has(chunk.type)) {
+          adapter
+            .onStageBoundary(chatId)
+            .catch((err) => {
+              logger.debug('onStageBoundary callback failed', {
+                chatId,
+                error: err instanceof Error ? err.message : String(err)
+              })
+            })
         }
         // Transparently forward image/file tool results produced by the stream.
         forwardToolAttachments(adapter, chatId, chunk)
       },
       onDone() {
-        notifyThinkingComplete()
         resolveExecution(accumulatedText.trim())
       },
       onPaused() {
-        notifyThinkingComplete()
         resolveExecution(accumulatedText.trim())
       },
       onError(result) {
-        notifyThinkingComplete()
         rejectExecution(new Error(result.error.message ?? 'Execution failed'))
       },
       isAlive: () => !abortController.signal.aborted

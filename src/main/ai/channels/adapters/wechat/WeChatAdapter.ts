@@ -8,19 +8,12 @@ import { parseDataUrl } from '@shared/utils/dataUrl'
 import { ChannelAdapter, type ChannelAdapterConfig, type SendMessageOptions } from '../../ChannelAdapter'
 import { registerAdapterFactory } from '../../ChannelManager'
 import { isSlashCommand } from '../../constants'
-import { FlushController } from '../../FlushController'
 import { resolveLocalFile } from '../../security/localFileResolver'
 import { resolveWorkspaceFile } from '../../security/WorkspaceFileGuard'
 import { FILE_EXTENSION_MIME_MAP, splitMessage } from '../../utils'
 import { type IncomingMessage, WeixinBot } from './WeChatProtocol'
 
 const WECHAT_MAX_LENGTH = 2000
-
-/** Minimum interval between incremental stream bubbles (typewriter pacing). */
-const STREAM_THROTTLE_MS = 300
-
-/** Prefix prepended to each thinking (reasoning) bubble. */
-const THINKING_PREFIX = '【思考中】'
 
 /** Markdown image reference: `![alt](path)` (optional quoted title tolerated). */
 const MARKDOWN_IMAGE_REF_RE = /!\[[^\]]*\]\(([^)]*)\)/g
@@ -33,51 +26,17 @@ function stripMarkdownImageRefs(text: string): string {
   return text.replace(MARKDOWN_IMAGE_REF_RE, '')
 }
 
-/**
- * Hold back a trailing, still-incomplete markdown image reference so the user
- * never sees raw markdown while the model is typing it. Once the reference
- * closes it is stripped; on completion the held-back tail is flushed anyway.
- */
-function trimIncompleteImageRef(text: string): string {
-  const start = text.lastIndexOf('![')
-  if (start < 0) return text
-  return text.slice(0, start)
-}
-
-/**
- * Compute the not-yet-sent suffix of `target` relative to what was already
- * delivered (`sent`). Streaming deltas are prefix-based; when a markdown image
- * reference gets stripped from the cumulative text the lengths can diverge, so
- * fall back to the longest common prefix instead of a naive `slice(sent.length)`.
- */
-function remainingAfterCommonPrefix(target: string, sent: string): string {
-  if (!target) return ''
-  if (sent && target.startsWith(sent)) return target.slice(sent.length)
-  if (sent.startsWith(target)) return ''
-  const max = Math.min(target.length, sent.length)
-  let i = 0
-  while (i < max && target[i] === sent[i]) i++
-  return target.slice(i)
-}
-
 class WeChatAdapter extends ChannelAdapter {
   private bot: WeixinBot | null = null
   private readonly tokenPath: string
   private readonly allowedChatIds: string[]
 
-  /** Per-chat throttled flush controller for incremental text streaming. */
-  private readonly streamControllers = new Map<string, FlushController>()
-  /** Per-chat latest cumulative full text handed to onTextUpdate. */
-  private readonly streamFullTexts = new Map<string, string>()
-  /** Per-chat text already delivered to the chat (used to compute deltas). */
-  private readonly streamSentText = new Map<string, string>()
-
-  /** Per-chat throttled flush controller for thinking (reasoning) bubbles. */
-  private readonly thinkingControllers = new Map<string, FlushController>()
-  /** Per-chat latest cumulative thinking text handed to onThinkingUpdate. */
-  private readonly thinkingFullTexts = new Map<string, string>()
-  /** Per-chat thinking text already delivered to the chat. */
-  private readonly thinkingSentText = new Map<string, string>()
+  /** Per-chat latest cumulative full text handed to onTextUpdate (send source). */
+  private readonly latestFullTexts = new Map<string, string>()
+  /** Per-chat text already delivered to the chat (used to compute the unsent tail). */
+  private readonly sentTexts = new Map<string, string>()
+  /** Per-chat send serialization queue — see `flushUnsentText`. */
+  private readonly sendQueues = new Map<string, Promise<void>>()
 
   constructor(config: ChannelAdapterConfig<'wechat'>) {
     super(config)
@@ -191,156 +150,108 @@ class WeChatAdapter extends ChannelAdapter {
     }
   }
 
-  // ── Incremental multi-bubble streaming ──────────────────────────
-  // WeChat iLink does not support editing a sent message in place, so streaming
-  // is emulated with incremental bubbles: a FlushController throttles ~300ms and
-  // only the not-yet-delivered text delta is sent as a new short message.
+  // ── 阶段性发送（v2）─────────────────────────────────────────────
+  // 微信 iLink 不支持原地编辑已发送消息，一期用 FlushController 增量气泡会把
+  // 流式正文拆成几十条碎气泡，触发微信快速消息上限被截断。二期改为：只把模型在
+  // 两次思考/工具调用之间产生的正文片段作为一条完整消息发出——onTextUpdate 仅
+  // 记录最新全文，不逐字发送；onStageBoundary 一次性发出未发送尾部。
 
   override async onTextUpdate(chatId: string, fullText: string): Promise<void> {
     if (!this.bot) return
-    this.streamFullTexts.set(chatId, fullText)
-    await this.getStreamController(chatId).throttledUpdate(STREAM_THROTTLE_MS)
+    // 只更新最新全文记录，不发送任何消息——发送由阶段边界/完成时触发
+    this.latestFullTexts.set(chatId, fullText)
   }
 
   /**
-   * Flush any remaining delta, deliver images referenced by the final text, and
-   * return true so the caller does not fall back to a duplicate sendMessage().
+   * 阶段边界：把 latestFullText 相对 sentText 的未发送尾部作为一条完整消息发出。
+   * 思考/工具调用本身不产生气泡，仅作为「正文阶段结束」的信号。
+   */
+  override async onStageBoundary(chatId: string): Promise<void> {
+    await this.flushUnsentText(chatId)
+  }
+
+  /**
+   * 流式完成：发掉剩余尾部，处理正文中的图片引用（发送真实图片并剥离 markdown
+   * 片段），清理状态。返回 true 让调用方不再回退到 sendMessage() 重复发送。
    */
   override async onStreamComplete(chatId: string, finalText: string): Promise<boolean> {
     if (!this.bot) return false
-    this.streamFullTexts.set(chatId, finalText)
-
-    const controller = this.streamControllers.get(chatId)
-    if (controller) {
-      controller.cancelPendingFlush()
-      await controller.waitForFlush()
-    }
-
-    // Send images referenced by the final text, removing their markdown fragments.
-    const cleanedText = await this.extractAndSendImages(chatId, finalText)
-    await this.flushStreamDelta(chatId, cleanedText)
-
-    this.streamControllers.delete(chatId)
-    this.streamFullTexts.delete(chatId)
-    this.streamSentText.delete(chatId)
+    this.latestFullTexts.set(chatId, finalText)
+    await this.flushUnsentText(chatId)
+    // 图片引用以真实图片发送（保留一期实现，图片逻辑后续阶段再处理）
+    await this.extractAndSendImages(chatId, finalText)
+    this.latestFullTexts.delete(chatId)
+    this.sentTexts.delete(chatId)
+    this.sendQueues.delete(chatId)
     return true
   }
 
   override async onStreamError(chatId: string, error: string | Error): Promise<void> {
-    if (!this.bot) return
-    // The base signature passes a string; accepting Error as well keeps the
-    // override compatible. Flush whatever text/thinking accumulated before the
-    // failure so the partial response is not silently lost.
+    // 基类签名传 string；兼容 Error 便于调用方直接透传。失败前已累积的正文
+    // 也按阶段边界的方式发掉，避免部分回答静默丢失，随后清理状态。
     this.log.warn('Stream error, flushing partial response', {
       chatId,
       error: error instanceof Error ? error.message : String(error)
     })
-
-    const controller = this.streamControllers.get(chatId)
-    if (controller) {
-      controller.cancelPendingFlush()
-      await controller.waitForFlush()
-    }
-    await this.flushStreamDelta(chatId)
-    this.streamControllers.delete(chatId)
-    this.streamFullTexts.delete(chatId)
-    this.streamSentText.delete(chatId)
-
-    const thinkingController = this.thinkingControllers.get(chatId)
-    if (thinkingController) {
-      thinkingController.cancelPendingFlush()
-      await thinkingController.waitForFlush()
-    }
-    await this.flushThinkingDelta(chatId)
-    this.thinkingControllers.delete(chatId)
-    this.thinkingFullTexts.delete(chatId)
-    this.thinkingSentText.delete(chatId)
+    await this.flushUnsentText(chatId)
+    this.latestFullTexts.delete(chatId)
+    this.sentTexts.delete(chatId)
+    this.sendQueues.delete(chatId)
   }
 
-  /** Send thinking (reasoning) deltas as prefixed, separate bubbles. */
-  override async onThinkingUpdate(chatId: string, thinking: string): Promise<void> {
-    if (!this.bot) return
-    this.thinkingFullTexts.set(chatId, thinking)
-    await this.getThinkingController(chatId).throttledUpdate(STREAM_THROTTLE_MS)
+  /** 微信不展示思考过程：思考更新与完成均为 no-op。 */
+  override async onThinkingUpdate(_chatId: string, _thinking: string): Promise<void> {}
+
+  /** 微信不展示思考过程：思考更新与完成均为 no-op。 */
+  override async onThinkingComplete(_chatId: string, _thinking: string): Promise<void> {}
+
+  /**
+   * 发送 latestFullText 相对 sentText 的未发送尾部，整条一次性发出
+   * （超 2000 字符用 splitMessage 分块，块间 10ms）。
+   *
+   * 阶段边界可能密集触发（如思考分片连续到达），因此按 chat 串行化：后到的
+   * 边界排在上一次发送完成之后，再重新计算未发送尾部，避免同一段正文被重复发送。
+   */
+  private flushUnsentText(chatId: string): Promise<void> {
+    const prev = this.sendQueues.get(chatId) ?? Promise.resolve()
+    const next = prev.then(() => this.doFlushUnsentText(chatId))
+    // 队列尾部吞掉异常防止断链（异常由调用方 fire-and-forget 的 catch 记录）
+    this.sendQueues.set(
+      chatId,
+      next.catch(() => {})
+    )
+    return next
   }
 
-  override async onThinkingComplete(chatId: string, thinking: string): Promise<void> {
-    if (!this.bot) return
-    this.thinkingFullTexts.set(chatId, thinking)
-    const controller = this.thinkingControllers.get(chatId)
-    if (controller) {
-      controller.cancelPendingFlush()
-      await controller.waitForFlush()
-    }
-    await this.flushThinkingDelta(chatId)
-
-    this.thinkingControllers.delete(chatId)
-    this.thinkingFullTexts.delete(chatId)
-    this.thinkingSentText.delete(chatId)
-  }
-
-  private getStreamController(chatId: string): FlushController {
-    let controller = this.streamControllers.get(chatId)
-    if (!controller) {
-      controller = new FlushController(() => this.flushStreamDelta(chatId))
-      this.streamControllers.set(chatId, controller)
-    }
-    return controller
-  }
-
-  private getThinkingController(chatId: string): FlushController {
-    let controller = this.thinkingControllers.get(chatId)
-    if (!controller) {
-      controller = new FlushController(() => this.flushThinkingDelta(chatId))
-      this.thinkingControllers.set(chatId, controller)
-    }
-    return controller
-  }
-
-  /** Send only the not-yet-delivered portion of the cumulative stream text. */
-  private async flushStreamDelta(chatId: string, fullTextOverride?: string): Promise<void> {
+  private async doFlushUnsentText(chatId: string): Promise<void> {
     const bot = this.bot
     if (!bot) return
-    const fullText = fullTextOverride ?? this.streamFullTexts.get(chatId) ?? ''
-    // Image references are delivered as real images, never as raw markdown text.
-    const cleanText = stripMarkdownImageRefs(fullText)
-    // While streaming, hold back a trailing incomplete reference; at completion
-    // the override path delivers everything (including a never-closed literal).
-    const deliverable = fullTextOverride === undefined ? trimIncompleteImageRef(cleanText) : cleanText
-    const sent = this.streamSentText.get(chatId) ?? ''
-    const remaining = remainingAfterCommonPrefix(deliverable, sent)
+    const fullText = this.latestFullTexts.get(chatId) ?? ''
+    // 图片引用在 onStreamComplete 里以真实图片发送，正文不出现原始 markdown
+    const deliverable = stripMarkdownImageRefs(fullText)
+    const sent = this.sentTexts.get(chatId) ?? ''
+    // 相对 sentText 的未发送尾部：常规为前缀差；被剥离的图片引用会让前后长度
+    // 不一致，退化为最长公共前缀
+    let remaining = ''
+    if (deliverable) {
+      if (sent && deliverable.startsWith(sent)) {
+        remaining = deliverable.slice(sent.length)
+      } else if (!sent.startsWith(deliverable)) {
+        const max = Math.min(deliverable.length, sent.length)
+        let i = 0
+        while (i < max && deliverable[i] === sent[i]) i++
+        remaining = deliverable.slice(i)
+      }
+    }
     if (!remaining) return
-    await this.sendTextChunks(bot, chatId, remaining)
-    this.streamSentText.set(chatId, deliverable)
-  }
-
-  /** Send thinking (reasoning) deltas as prefixed, separate bubbles. */
-  private async flushThinkingDelta(chatId: string): Promise<void> {
-    const bot = this.bot
-    if (!bot) return
-    const fullThinking = this.thinkingFullTexts.get(chatId) ?? ''
-    const sent = this.thinkingSentText.get(chatId) ?? ''
-    if (fullThinking.length <= sent.length) return
-    const delta = fullThinking.slice(sent.length)
-    await this.sendThinkingChunks(bot, chatId, delta)
-    this.thinkingSentText.set(chatId, fullThinking)
-  }
-
-  /** Split and send text, each bubble capped at WECHAT_MAX_LENGTH. */
-  private async sendTextChunks(bot: WeixinBot, chatId: string, text: string): Promise<void> {
-    if (!text) return
-    const chunks = splitMessage(text, WECHAT_MAX_LENGTH)
-    for (const chunk of chunks) {
-      await bot.send(chatId, chunk)
+    const chunks = splitMessage(remaining, WECHAT_MAX_LENGTH)
+    for (let i = 0; i < chunks.length; i++) {
+      await bot.send(chatId, chunks[i])
+      if (i < chunks.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
     }
-  }
-
-  private async sendThinkingChunks(bot: WeixinBot, chatId: string, text: string): Promise<void> {
-    if (!text.trim()) return
-    const chunks = splitMessage(text, WECHAT_MAX_LENGTH)
-    for (const chunk of chunks) {
-      await bot.send(chatId, `${THINKING_PREFIX}${chunk}`)
-    }
+    this.sentTexts.set(chatId, deliverable)
   }
 
   /**

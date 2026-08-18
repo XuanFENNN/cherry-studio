@@ -247,6 +247,18 @@ export abstract class ChannelAdapter extends EventEmitter {
   }
 
   /**
+   * Called when a stage boundary is detected in the stream — the model
+   * starts/continues thinking or invokes a tool. The text accumulated so far
+   * is a complete stage; the adapter decides when/how to deliver it as one
+   * full message. This hook only notifies the adapter of the boundary — the
+   * caller never sends messages on its behalf.
+   */
+  // oxlint-disable-next-line no-unused-vars
+  async onStageBoundary(_chatId: string): Promise<void> {
+    // Default no-op.
+  }
+
+  /**
    * Called on every thinking update during streaming. The adapter decides
    * internally when/how to surface the thinking content to the platform.
    * @param thinking - The full cumulative thinking content so far.
