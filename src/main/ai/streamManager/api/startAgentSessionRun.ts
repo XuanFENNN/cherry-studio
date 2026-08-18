@@ -5,7 +5,7 @@ import type { CherryMessagePart } from '@shared/data/types/message'
 
 import { buildAgentSessionTopicId } from '../../agentSession/topic'
 import { agentChatContextProvider } from '../context/AgentChatContextProvider'
-import { resolveSessionChannelListeners } from '../listeners/resolveSessionChannelPushback'
+import { extractReplayBaselineText, resolveSessionChannelListeners } from '../listeners/resolveSessionChannelPushback'
 import type { StreamListener } from '../types'
 
 /**
@@ -129,7 +129,10 @@ export async function startAgentSessionRun(input: {
       input.channelPushback !== false
         ? resolveSessionChannelListeners({
             sessionId: input.sessionId,
-            existingIds: new Set(allListeners.map((listener) => listener.id))
+            existingIds: new Set(allListeners.map((listener) => listener.id)),
+            // 频道入站 / 定时任务由 prepareDispatch 构建请求，末条通常为 user（普通新回合，
+            // 无历史重放）→ 基线为空串，行为不变；若未来出现延续语义，同样只推送基线之后的新增。
+            baselineText: extractReplayBaselineText(prepared.models[0]?.request.messages)
           })
         : []
 

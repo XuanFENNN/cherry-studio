@@ -21,12 +21,39 @@ import type { StreamListener } from '../types'
  *
  * 幂等：existingIds 中已有的 `channel:${channelId}:${chatId}` 一律跳过，不覆盖调用方
  * 自带 listener（如 runAgentTask 的 suppressErrorMessage=true 订阅 listener 优先级不变）。
- * 每个 (channelId, chatId) 构建 `new ChannelAdapterListener(adapter, chatId, false)`，
- * 与频道入站一致：不 suppress 错误文案、无 replyToMessageId（唤醒无入站消息可 reply）。
+ * 每个 (channelId, chatId) 构建 `new ChannelAdapterListener(adapter, chatId, false, undefined,
+ * baselineText)`，与频道入站一致：不 suppress 错误文案、无 replyToMessageId（唤醒无入站消息
+ * 可 reply）；baselineText 由调用方按本 turn 请求的延续锚点解析（见 extractReplayBaselineText）。
  */
+
+/**
+ * 从请求消息列表提取「本 turn 会以 text-delta 重放的基线文本」。
+ *
+ * AI SDK 的延续（continue-conversation）语义下，请求最后一条为 assistant 消息（延续锚点）
+ * 时，UIMessageStream 会先把该锚点消息已有的 text 部分以 text-delta 整段重放，随后才是本
+ * turn 新生成的内容。拼接锚点消息全部 text 部分即为重放文本；请求末条为 user（普通新回合，
+ * 无重放）或消息列表为空时返回空串。
+ */
+export function extractReplayBaselineText(
+  messages: ReadonlyArray<{ role?: string; parts?: ReadonlyArray<{ type?: string; text?: unknown }> }> | undefined
+): string {
+  const anchor = messages?.at(-1)
+  if (!anchor || anchor.role !== 'assistant' || !Array.isArray(anchor.parts)) return ''
+  let baseline = ''
+  for (const part of anchor.parts) {
+    if (part && part.type === 'text' && typeof part.text === 'string') baseline += part.text
+  }
+  return baseline
+}
+
 export function resolveSessionChannelListeners(input: {
   sessionId: string
   existingIds: ReadonlySet<string>
+  /**
+   * 本 turn 会以 text-delta 重放的基线文本（延续锚点既有文本，见 `extractReplayBaselineText`）。
+   * 传给 `ChannelAdapterListener` 后只推送基线之后的新增部分，避免把上一回合全文重复推回频道。
+   */
+  baselineText?: string
 }): StreamListener[] {
   const bindings = resolveChannelBindings(input.sessionId)
   if (bindings.length === 0) return []
@@ -41,7 +68,7 @@ export function resolveSessionChannelListeners(input: {
     // 幂等去重：跳过本次已挂的，以及调用方自带 listener 已覆盖的（id 相同即同一目标）
     if (seen.has(id) || input.existingIds.has(id)) continue
     seen.add(id)
-    listeners.push(new ChannelAdapterListener(adapter, chatId, false))
+    listeners.push(new ChannelAdapterListener(adapter, chatId, false, undefined, input.baselineText ?? ''))
   }
   return listeners
 }

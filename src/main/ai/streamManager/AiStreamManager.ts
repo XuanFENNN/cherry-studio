@@ -37,7 +37,7 @@ import { createChatStreamLifecycle } from './lifecycle/ChatStreamLifecycle'
 import { promptStreamLifecycle } from './lifecycle/PromptStreamLifecycle'
 import type { StreamLifecycle } from './lifecycle/StreamLifecycle'
 import { TerminalPersistenceError } from './listeners/PersistenceListener'
-import { resolveSessionChannelListeners } from './listeners/resolveSessionChannelPushback'
+import { resolveSessionChannelListeners, extractReplayBaselineText } from './listeners/resolveSessionChannelPushback'
 import { isRendererListener, WebContentsListener } from './listeners/WebContentsListener'
 import { MessageRuntimeTimingCollector } from './MessageRuntimeTimingCollector'
 import { pipeStreamLoop } from './pipeStreamLoop'
@@ -878,7 +878,13 @@ export class AiStreamManager extends BaseService {
     const existing = this.activeStreams.get(input.topicId)
     const carriedListeners = existing
       ? [...existing.listeners.values()].filter(
-          (listener) => !listener.id.startsWith('persistence:') && !listener.id.startsWith('agent-runtime:')
+          (listener) =>
+            !listener.id.startsWith('persistence:') &&
+            !listener.id.startsWith('agent-runtime:') &&
+            // 频道推送 listener 不跨 turn 沿用：旧 listener 已累计旧回合全文，直接沿用会让新
+            // turn 的累计文本变成「旧全文 + 重放 + 新输出」再次重复推送。每个 turn 都由下方
+            // resolveSessionChannelListeners 按当 turn 基线重建一个全新的（id 相同会幂等跳过）。
+            !listener.id.startsWith('channel:')
         )
       : []
 
@@ -899,7 +905,11 @@ export class AiStreamManager extends BaseService {
             ...allListeners,
             ...resolveSessionChannelListeners({
               sessionId: extractAgentSessionId(input.topicId),
-              existingIds: new Set(allListeners.map((listener) => listener.id))
+              existingIds: new Set(allListeners.map((listener) => listener.id)),
+              // 后台唤醒 turn 若为延续（continue-conversation），AI SDK 会把请求末条 assistant
+              // 锚点的既有文本以 text-delta 重放；把基线传给 listener 后只推送基线之后的新增
+              // 部分，避免把上一回合全文连同新输出重复推回频道。普通新回合（末条为 user）为 ''。
+              baselineText: extractReplayBaselineText(input.request.messages)
             })
           ]
         : allListeners
