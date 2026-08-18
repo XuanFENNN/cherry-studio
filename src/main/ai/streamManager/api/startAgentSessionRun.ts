@@ -5,6 +5,7 @@ import type { CherryMessagePart } from '@shared/data/types/message'
 
 import { buildAgentSessionTopicId } from '../../agentSession/topic'
 import { agentChatContextProvider } from '../context/AgentChatContextProvider'
+import { resolveSessionChannelListeners } from '../listeners/resolveSessionChannelPushback'
 import type { StreamListener } from '../types'
 
 /**
@@ -35,6 +36,8 @@ export async function startAgentSessionRun(input: {
   listeners: StreamListener[]
   headless?: boolean
   requireIdle?: { expectedAgentId: string }
+  /** 后台唤醒响应是否自动推回会话绑定的频道（默认 true；静默后台维护 turn 可显式传 false 关掉） */
+  channelPushback?: boolean
 }): Promise<StartAgentSessionRunResult> {
   if (input.listeners.length === 0) {
     throw new Error('startAgentSessionRun requires at least one listener')
@@ -113,14 +116,27 @@ export async function startAgentSessionRun(input: {
       throw error
     }
 
+    // 组装最终 listener 列表（保持 requireIdle 下原有的顺序语义：primary 在最前）
+    const allListeners = input.requireIdle
+      ? [primary, ...extras, ...prepared.listeners.filter((listener) => listener.id !== primary.id)]
+      : [...prepared.listeners, ...extras]
+
+    // 后台唤醒响应自动推回频道（方案 A + 门控）：在 extras 之后追加会话绑定频道的
+    // channel listener。频道入站自带 / runAgentTask 订阅的 `channel:…` listener 已在
+    // existingIds 中 → 幂等跳过（不覆盖调用方自带 listener 的选项）；外部唤醒注入
+    // （调用方不知道微信 chatId）→ 自动补挂，把回应流式推回会话所属频道。
+    const channelPushbackListeners =
+      input.channelPushback !== false
+        ? resolveSessionChannelListeners({
+            sessionId: input.sessionId,
+            existingIds: new Set(allListeners.map((listener) => listener.id))
+          })
+        : []
+
     manager.send({
       topicId: prepared.topicId,
       models: prepared.models,
-      // In require-idle mode the primary task listener must deactivate the task/channel listeners
-      // before the runtime terminal listener can queue a successor. Preserve ordinary caller order.
-      listeners: input.requireIdle
-        ? [primary, ...extras, ...prepared.listeners.filter((listener) => listener.id !== primary.id)]
-        : [...prepared.listeners, ...extras],
+      listeners: [...allListeners, ...channelPushbackListeners],
       siblingsGroupId: prepared.siblingsGroupId,
       lifecycle: prepared.lifecycle
     })

@@ -713,6 +713,24 @@ export class ChannelMessageHandler {
     }
   }
 
+  /**
+   * 反向扫描 sessionTracker（`${agentId}:${channelId}:${chatId} → sessionId`），返回绑定到
+   * 该会话的全部 (channelId, chatId) 对（精确到 chat）。只读，不触发任何会话创建或绑定变更。
+   * 供后台唤醒响应的频道路由（`resolveSessionChannelListeners`）作为内存反向索引优先使用：
+   * 内存索引优于持久 `channel.sessionId`（/new 换会话后进程内仍指向最新绑定，重启才丢失）。
+   */
+  getChatBindingsForSession(sessionId: string): Array<{ channelId: string; chatId: string }> {
+    const bindings: Array<{ channelId: string; chatId: string }> = []
+    for (const [key, trackedSessionId] of this.sessionTracker) {
+      if (trackedSessionId !== sessionId) continue
+      const [agentId, channelId, ...chatIdParts] = key.split(':')
+      const chatId = chatIdParts.join(':')
+      if (!agentId || !channelId || !chatId) continue
+      bindings.push({ channelId, chatId })
+    }
+    return bindings
+  }
+
   /** Abort an active stream for the given session. Returns true if a stream was in flight. */
   abortSession(sessionId: string): boolean {
     if (!this.activeAbortControllers.has(sessionId)) return false

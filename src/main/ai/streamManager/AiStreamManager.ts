@@ -37,6 +37,7 @@ import { createChatStreamLifecycle } from './lifecycle/ChatStreamLifecycle'
 import { promptStreamLifecycle } from './lifecycle/PromptStreamLifecycle'
 import type { StreamLifecycle } from './lifecycle/StreamLifecycle'
 import { TerminalPersistenceError } from './listeners/PersistenceListener'
+import { resolveSessionChannelListeners } from './listeners/resolveSessionChannelPushback'
 import { isRendererListener, WebContentsListener } from './listeners/WebContentsListener'
 import { MessageRuntimeTimingCollector } from './MessageRuntimeTimingCollector'
 import { pipeStreamLoop } from './pipeStreamLoop'
@@ -129,6 +130,8 @@ export interface StartRuntimeTurnInput {
   listeners: StreamListener[]
   rootSpan?: Span
   abortController?: AbortController
+  /** 后台唤醒响应是否自动推回会话绑定的频道（默认 true；静默后台维护 turn 可显式传 false 关掉） */
+  channelPushback?: boolean
 }
 
 // ── Inspection snapshots ────────────────────────────────────────────
@@ -881,6 +884,26 @@ export class AiStreamManager extends BaseService {
 
     if (existing) this.evictStream(input.topicId)
 
+    const allListeners = [...carriedListeners, ...input.listeners]
+
+    // 后台唤醒响应自动推回频道（方案 A）：agent-session topic 的每次运行时驱动 turn
+    // （startNextTurn / startDeferredTurn / startReceiveOnlyTurn / startContinuationTurn）启动时，
+    // 若会话有频道绑定且本次 listener 集合缺少该频道的 `channel:` listener，则同步补挂。
+    // 长任务（分钟/小时级）完成后旧 stream 早已 evict（30s 宽限期外），carriedListeners 为空，
+    // 此前新 turn 只有三件套 → 输出只写 agent_session_message 不推微信；这里补上推送。
+    // 桌面手动对话走 dispatch，不进本方法，天然豁免；channelPushback=false 可显式静默。
+    // 方法内同步执行：findBySessionId（DB 读）+ getChatBindingsForSession/getAdapter（内存查）均同步。
+    const listeners =
+      input.channelPushback !== false && isAgentSessionTopic(input.topicId)
+        ? [
+            ...allListeners,
+            ...resolveSessionChannelListeners({
+              sessionId: extractAgentSessionId(input.topicId),
+              existingIds: new Set(allListeners.map((listener) => listener.id))
+            })
+          ]
+        : allListeners
+
     return this.send({
       topicId: input.topicId,
       models: [
@@ -892,7 +915,7 @@ export class AiStreamManager extends BaseService {
           abortController: input.abortController
         }
       ],
-      listeners: [...carriedListeners, ...input.listeners]
+      listeners
     })
   }
 
