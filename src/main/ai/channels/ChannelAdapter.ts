@@ -246,6 +246,26 @@ export abstract class ChannelAdapter extends EventEmitter {
     // Default no-op.
   }
 
+  /**
+   * Called on every thinking update during streaming. The adapter decides
+   * internally when/how to surface the thinking content to the platform.
+   * @param thinking - The full cumulative thinking content so far.
+   */
+  // oxlint-disable-next-line no-unused-vars
+  async onThinkingUpdate(_chatId: string, _thinking: string): Promise<void> {
+    // Default no-op — adapters that support thinking display should override.
+  }
+
+  /**
+   * Called when thinking is complete. The adapter should finalize any
+   * thinking-related UI (close thinking card, etc.).
+   * @param thinking - The final complete thinking content.
+   */
+  // oxlint-disable-next-line no-unused-vars
+  async onThinkingComplete(_chatId: string, _thinking: string): Promise<void> {
+    // Default no-op — adapters that support thinking display should override.
+  }
+
   // Typed event emitter overrides
   override emit(event: 'message', data: ChannelMessageEvent): boolean
   override emit(event: 'command', data: ChannelCommandEvent): boolean

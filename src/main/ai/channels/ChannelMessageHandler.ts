@@ -49,6 +49,90 @@ type PendingBatch = {
   resolvers: BatchResolver[]
 }
 
+/**
+ * Transparently forward image/file outputs embedded in stream tool-result
+ * chunks to the adapter, so tool-generated media (e.g. an image the agent
+ * produced) reaches the chat. Handles several result shapes defensively:
+ * direct `FileAttachment`-like objects (`{ filename, data, media_type, size }`),
+ * AI SDK file parts (`{ type: 'image'|'file', data|image, mimeType|mediaType,
+ * name }`) and nested containers (`{ images: [...], files: [...] }`).
+ */
+function forwardToolAttachments(adapter: ChannelAdapter, chatId: string, chunk: unknown): void {
+  if (!chunk || typeof chunk !== 'object') return
+  const record = chunk as Record<string, unknown>
+  if (record.type !== 'tool-result' && record.type !== 'file') return
+
+  const attachments: FileAttachment[] = []
+  const visited = new WeakSet<object>()
+  const collect = (value: unknown, depth: number): void => {
+    if (depth > 3 || value === null || typeof value !== 'object') return
+    if (visited.has(value)) return
+    visited.add(value)
+
+    if (Array.isArray(value)) {
+      for (const item of value) collect(item, depth + 1)
+      return
+    }
+
+    const obj = value as Record<string, unknown>
+    // Cherry `FileAttachment` projection: { filename, data, media_type, size }
+    if (typeof obj.filename === 'string' && typeof obj.data === 'string' && typeof obj.media_type === 'string') {
+      attachments.push({
+        filename: obj.filename,
+        data: obj.data,
+        media_type: obj.media_type,
+        size: typeof obj.size === 'number' ? obj.size : obj.data.length
+      })
+      return
+    }
+    // AI SDK file parts: { type: 'image'|'file', data|image, mimeType|mediaType, name }
+    if (obj.type === 'image' || obj.type === 'file') {
+      let data = ''
+      if (typeof obj.data === 'string') data = obj.data
+      else if (typeof obj.image === 'string') data = obj.image
+      else if (obj.data instanceof Uint8Array) data = Buffer.from(obj.data).toString('base64')
+      if (data) {
+        const mediaType =
+          typeof obj.mediaType === 'string'
+            ? obj.mediaType
+            : typeof obj.mimeType === 'string'
+              ? obj.mimeType
+              : 'application/octet-stream'
+        attachments.push({
+          filename: typeof obj.name === 'string' ? obj.name : 'tool-output',
+          data: data.startsWith('data:') ? data.slice(data.indexOf(',') + 1) : data,
+          media_type: mediaType,
+          size: data.length
+        })
+      }
+      return
+    }
+    // Nested containers
+    for (const key of ['images', 'files', 'image', 'file', 'attachments', 'content']) {
+      if (key in obj) collect(obj[key], depth + 1)
+    }
+  }
+
+  const part = record.part
+  collect(part, 0)
+  if (record.type === 'tool-result') {
+    const result = part && typeof part === 'object' ? (part as Record<string, unknown>).result : undefined
+    collect(result, 0)
+  }
+
+  for (const attachment of attachments) {
+    void adapter
+      .sendFile(chatId, attachment)
+      .catch((err) => {
+        logger.debug('Failed to forward tool attachment to channel', {
+          chatId,
+          filename: attachment.filename,
+          error: err instanceof Error ? err.message : String(err)
+        })
+      })
+  }
+}
+
 export class ChannelMessageHandler {
   // TODO: in v2 use cacheService
   private readonly sessionTracker = new Map<string, string>() // `${agentId}:${channelId}:${chatId}` -> sessionId
@@ -802,19 +886,53 @@ export class ChannelMessageHandler {
       rejectExecution = reject
     })
     let accumulatedText = ''
+    let accumulatedThinking = ''
+    // Fire-and-forget thinking completion callback, shared by all terminal states.
+    const notifyThinkingComplete = (): void => {
+      adapter
+        .onThinkingComplete(chatId, accumulatedThinking)
+        .catch((err) => {
+          logger.debug('onThinkingComplete callback failed', {
+            chatId,
+            error: err instanceof Error ? err.message : String(err)
+          })
+        })
+    }
     const sentinel: StreamListener = {
       id: `channel-completion:${chatId}`,
       onChunk(chunk) {
         // `text-delta`'s field is `delta`, not `text` (AI SDK `UIMessageChunk`).
-        if (chunk.type === 'text-delta') accumulatedText += chunk.delta
+        if (chunk.type === 'text-delta') {
+          accumulatedText += chunk.delta
+        } else if (chunk.type === 'reasoning-delta') {
+          // Accumulate incremental reasoning deltas and surface them through the
+          // adapter's thinking hooks (the adapter throttles its own flushing).
+          const delta = (chunk as unknown as { delta?: string }).delta
+          if (delta) {
+            accumulatedThinking += delta
+            adapter
+              .onThinkingUpdate(chatId, accumulatedThinking)
+              .catch((err) => {
+                logger.debug('onThinkingUpdate callback failed', {
+                  chatId,
+                  error: err instanceof Error ? err.message : String(err)
+                })
+              })
+          }
+        }
+        // Transparently forward image/file tool results produced by the stream.
+        forwardToolAttachments(adapter, chatId, chunk)
       },
       onDone() {
+        notifyThinkingComplete()
         resolveExecution(accumulatedText.trim())
       },
       onPaused() {
+        notifyThinkingComplete()
         resolveExecution(accumulatedText.trim())
       },
       onError(result) {
+        notifyThinkingComplete()
         rejectExecution(new Error(result.error.message ?? 'Execution failed'))
       },
       isAlive: () => !abortController.signal.aborted
